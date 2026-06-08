@@ -50,6 +50,10 @@ class Enc(Enum):
 
     Default priority order is ZRLE, TRLE, ZLIB, COPY, RAW.
 
+    Pseudo-encodings (negative values per the RFB spec) carry server
+    notifications rather than pixel data and are not advertised by default
+    in SetEncodings -- the dispatch in Video.read still handles them if a
+    server pushes one unsolicited (e.g. on a server-side geometry change).
     """
 
     #: ZRLE encoding.
@@ -67,12 +71,26 @@ class Enc(Enum):
     #: Raw encoding.
     RAW = 0
 
+    #: DesktopSize pseudo-encoding (RFB §7.7.2). Server-side geometry
+    #: change; rect.width/height carry the new dimensions, no payload.
+    DESKTOP_SIZE = -223
+
+    #: ExtendedDesktopSize pseudo-encoding (libvncserver/RealVNC ext).
+    #: Same intent as DESKTOP_SIZE plus a multi-screen layout payload.
+    EXTENDED_DESKTOP_SIZE = -308
+
     @classmethod
     def default(cls):
         """
-        Get a list of supported encodings expect RAW.
+        Get the default list of supported encodings.
+
+        Excludes RAW (value 0) and pseudo-encodings (negative). Callers
+        wanting resize notifications can opt in explicitly, e.g.
+        ``EncList() + Enc.EXTENDED_DESKTOP_SIZE``, but be aware that
+        TigerVNC treats EDS in SetEncodings as a subscription that returns
+        EDS-only FBU responses, starving the screenshot path of pixel data.
         """
-        return filter(lambda x: x.value != 0, cls)
+        return filter(lambda x: x.value > 0, cls)
 
 class EncList(list):
     """
@@ -542,7 +560,8 @@ class Video:
             writer.write(b'\x00\x00\x00\x00' + video_definition.get(mode) + b'\x00\x00\x00')
 
         writer.write(b'\x02\x00'+len(encodings).to_bytes(2, 'big'))
-        writer.write(b''.join(map(lambda x: x.value.to_bytes(4, 'big'), encodings)))
+        # signed=True to allow pseudo-encodings (negative values per RFB spec).
+        writer.write(b''.join(map(lambda x: x.value.to_bytes(4, 'big', signed=True), encodings)))
 
         decompress = decompressobj()
 
@@ -587,6 +606,27 @@ class Video:
             y.to_bytes(2, 'big') +
             width.to_bytes(2, 'big') +
             height.to_bytes(2, 'big'))
+
+    def _handle_desktop_resize(self, new_width: int, new_height: int):
+        """
+        Apply a DesktopSize / ExtendedDesktopSize pseudo-encoding rect.
+
+        Only invalidates the framebuffer on an actual size change. Some
+        servers echo the current size as an informational EDS rect even
+        when nothing changed; treating that as "data invalid + need
+        refresh" would deadlock the screenshot path.
+
+        Does not auto-request a refresh -- callers (Client.screenshot)
+        check whether their region became incomplete and re-request as
+        needed. This keeps the rect handler free of side effects on the
+        writer side, which would otherwise race with in-flight FBURs.
+        """
+        if (new_width, new_height) == (self.width, self.height):
+            return
+        self.width = new_width
+        self.height = new_height
+        self.data = None
+        self.serial = (self.serial + 1) & 0xfffffff
 
     def _update_rect(self, x1: int, x2: int, y1: int, y2: int, data: np.ndarray):
         """
@@ -662,7 +702,12 @@ class Video:
         y = await read_int(self.reader, 2)
         width = await read_int(self.reader, 2)
         height = await read_int(self.reader, 2)
-        encoding = Enc(await read_int(self.reader, 4))
+        # Encoding number is signed 32-bit on the wire. read_int is unsigned,
+        # so convert wrap-around values back to negative for pseudo-encodings.
+        raw_enc = await read_int(self.reader, 4)
+        if raw_enc > 0x7FFFFFFF:
+            raw_enc -= 0x100000000
+        encoding = Enc(raw_enc)
         length = height * width * 4
 #        print(f"GET VIDEO REC: {x} {y} {width}x{height} / {encoding}")
 
@@ -687,6 +732,20 @@ class Video:
         elif encoding is Enc.COPY:
             await self.process_copy(self.reader,
                                  x, y, width, height)
+
+        elif encoding is Enc.DESKTOP_SIZE:
+            # No payload -- rect.width/height carry the new dimensions.
+            self._handle_desktop_resize(width, height)
+
+        elif encoding is Enc.EXTENDED_DESKTOP_SIZE:
+            # Payload: num_screens (u8) + 3 padding bytes, then per-screen
+            # records (16 bytes each: id u32, x u16, y u16, w u16, h u16,
+            # flags u32). We don't surface per-screen info; rect.width/height
+            # carry the new framebuffer dimensions.
+            num_screens = await read_int(self.reader, 1)
+            await self.reader.readexactly(3)  # reserved padding
+            await self.reader.readexactly(num_screens * 16)
+            self._handle_desktop_resize(width, height)
 
         else:
             raise ValueError(encoding)
@@ -932,6 +991,11 @@ class Client:
             if update_type is UpdateType.VIDEO:
                 if self.video.is_complete(x, y, width, height):
                     return self.video.as_rgba(x, y, width, height)
+                # FBU arrived but didn't fill the requested region. Common
+                # causes: an unsolicited DESKTOP_SIZE/EDS rect invalidated
+                # the buffer mid-stream, or the server split the response.
+                # Re-request to keep the loop making progress.
+                self.video.refresh(x, y, width, height)
 
 
 @asynccontextmanager
